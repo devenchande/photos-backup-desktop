@@ -247,6 +247,11 @@ function registerIpc() {
   });
 }
 
+// Some Windows graphics drivers leave GPU-composited windows (notably the
+// Google sign-in window) painting blank. Software rendering avoids that; it
+// must be called before the app is ready. The sandbox stays on — see auth.js.
+app.disableHardwareAcceleration();
+
 app.whenReady().then(() => {
   eventLog().record('app', `Photos Backup launched (version ${app.getVersion()})`);
   registerIpc();
