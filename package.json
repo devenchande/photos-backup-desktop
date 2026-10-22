@@ -20,6 +20,7 @@
     "productName": "Photos Backup",
     "afterPack": "./build/afterPack.js",
     "electronLanguages": [
+      "en-US",
       "en_US"
     ],
     "files": [
