@@ -20,6 +20,7 @@ const els = {
   retryButton: document.getElementById('retryButton'),
   storageSaverToggle: document.getElementById('storageSaverToggle'),
   useQuotaToggle: document.getElementById('useQuotaToggle'),
+  dateFromFilenameToggle: document.getElementById('dateFromFilenameToggle'),
   concurrencySelect: document.getElementById('concurrencySelect'),
   summary: document.getElementById('summary'),
   scanNote: document.getElementById('scanNote'),
@@ -32,7 +33,7 @@ const els = {
 
 const state = {
   account: { status: 'disconnected' },
-  settings: { folders: [], storageSaver: false, useQuota: false, concurrency: 2 },
+  settings: { folders: [], storageSaver: false, useQuota: false, dateFromFilename: true, concurrency: 2 },
   snapshot: null,
   filter: 'all',
 };
@@ -96,6 +97,7 @@ function render() {
 
   els.storageSaverToggle.checked = !!state.settings.storageSaver;
   els.useQuotaToggle.checked = !!state.settings.useQuota;
+  els.dateFromFilenameToggle.checked = !!state.settings.dateFromFilename;
   els.concurrencySelect.value = String(state.settings.concurrency || 2);
 
   // Queue controls
@@ -318,6 +320,10 @@ els.storageSaverToggle.onchange = async () => {
 };
 els.useQuotaToggle.onchange = async () => {
   state.settings = await window.photosBackup.updateSettings({ useQuota: els.useQuotaToggle.checked });
+  render();
+};
+els.dateFromFilenameToggle.onchange = async () => {
+  state.settings = await window.photosBackup.updateSettings({ dateFromFilename: els.dateFromFilenameToggle.checked });
   render();
 };
 els.concurrencySelect.onchange = async () => {
