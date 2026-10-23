@@ -223,7 +223,7 @@ function registerIpc() {
 
   ipcMain.handle('update-settings', (_event, patch) => {
     const allowed = {};
-    for (const key of ['storageSaver', 'useQuota', 'autoStart']) {
+    for (const key of ['storageSaver', 'useQuota', 'dateFromFilename', 'autoStart']) {
       if (key in patch) allowed[key] = !!patch[key];
     }
     if ('concurrency' in patch) allowed.concurrency = clampConcurrency(patch.concurrency);

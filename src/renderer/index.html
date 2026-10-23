@@ -59,6 +59,7 @@
           <div class="toggles">
             <label class="toggle"><input type="checkbox" id="storageSaverToggle"> Storage Saver</label>
             <label class="toggle"><input type="checkbox" id="useQuotaToggle"> Count against storage quota</label>
+            <label class="toggle"><input type="checkbox" id="dateFromFilenameToggle"> Date from filename</label>
             <label class="toggle">Simultaneous uploads
               <select id="concurrencySelect" class="concurrency">
                 <option>1</option><option>2</option><option>3</option><option>4</option>
@@ -74,6 +75,8 @@
           use your Google storage; the Google Photos app may then label them
           “Storage saver” even though the original file was kept. The file size, or
           Google Photos on the web, shows the real quality.
+          Date from filename dates a file by a date in its name, such as
+          IMG_20240709_182027.jpg, when the file has no date of its own inside it.
         </p>
         <div class="actions">
           <button id="backupButton" class="primary">Back up now</button>

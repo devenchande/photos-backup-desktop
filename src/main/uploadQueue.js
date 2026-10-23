@@ -13,6 +13,7 @@
 const path = require('path');
 const { GPMCClient, GPMCError } = require('./gpmc');
 const { signature } = require('./settings');
+const { captureDate } = require('./filenameDate');
 const { eventLog } = require('./diagnostics');
 const { PreparationMarkers, InterruptionCounters } = require('./preparationGuard');
 
@@ -309,7 +310,9 @@ class UploadQueue {
       item.attempts += 1;
       const result = await this.client.upload(item.path, {
         filename: item.filename,
-        modified: new Date(item.mtimeMs),
+        modified: this.settings.get('dateFromFilename')
+          ? captureDate(item.filename, item.mtimeMs)
+          : new Date(item.mtimeMs),
         useQuota,
         saver: storageSaver,
         signal: this.abort.signal,

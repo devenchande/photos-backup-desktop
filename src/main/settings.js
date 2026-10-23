@@ -22,6 +22,10 @@ const DEFAULT_SETTINGS = {
   // File each upload into an album named after its parent folder (the
   // gotohp AUTO album mode, applied per file).
   albumsFromFolders: true,
+  // Date uploads from their filename (IMG_20240709_182027.jpg) before falling
+  // back to the modification time. Google still prefers a date embedded in
+  // the file; this only decides the date for files without one.
+  dateFromFilename: true,
 };
 
 function migrate(data) {
