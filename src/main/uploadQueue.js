@@ -92,7 +92,9 @@ class UploadQueue {
   // `limit` mirrors the upstream's bounded batches (250 per foreground run).
   async enqueueScan(scanResults, limit = Infinity) {
     this.cancelRequested = false;
-    this.abort = new AbortController();
+    // Files can now be added while uploads run; replacing a live controller
+    // would leave those uploads out of reach of Cancel.
+    if (this.abort.signal.aborted) this.abort = new AbortController();
     const completed = this.settings.loadCompleted(this.email);
     const existing = new Map(this.items.map((item) => [item.path, item]));
     // Pending = found items that are neither recorded as completed for this
@@ -331,7 +333,7 @@ class UploadQueue {
       });
       // Filed before the item counts as completed: if this fails the item is
       // retried, and the retry's hash check finds the copy already uploaded.
-      if (this.settings.get('albumsFromFolders') && result.mediaKey) {
+      if (this.settings.get('albumsFromFolders') && result.mediaKey && !item.skipAlbum) {
         item.status = 'addingToAlbum';
         item.detail = folderAlbumName(item.path);
         this.emitSnapshot();
