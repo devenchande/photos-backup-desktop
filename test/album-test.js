@@ -174,6 +174,17 @@ async function disabled() {
   console.log('test 6 OK: with the setting off, no album calls are made');
 }
 
+async function pickedFilesSkipAlbums() {
+  const log = [];
+  const settings = fakeSettings({ albumsFromFolders: true });
+  const queue = new UploadQueue({ credential: { authData: AUTH, email: 'u' }, settings, clientFactory: () => stubClient(log) });
+  await queue.enqueueScan([{ ...found(path.join('C:\\', 'Trip', 'a.jpg')), skipAlbum: true }]);
+  await waitIdle(queue);
+  assert.deepStrictEqual(log, []);
+  assert.strictEqual(queue.items[0].status, 'uploaded');
+  console.log('test 7 OK: files uploaded on their own are not put into a folder album');
+}
+
 (async () => {
   await wireFormat();
   albumName();
@@ -181,6 +192,7 @@ async function disabled() {
   await refusedAlbumIsRecreated();
   await transientFailureIsNotCompleted();
   await disabled();
+  await pickedFilesSkipAlbums();
   console.log('album tests passed');
   process.exit(0);
 })().catch((error) => { console.error(error); process.exit(1); });

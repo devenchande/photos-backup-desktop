@@ -47,10 +47,19 @@
       <div class="card">
         <div class="card-head">
           <h2>Folders</h2>
-          <button id="addFolderButton" class="secondary">Add Folder…</button>
+          <div class="head-actions">
+            <button id="uploadPhotosButton" class="secondary">Upload Photos…</button>
+            <button id="addFolderButton" class="secondary">Add Folder…</button>
+          </div>
         </div>
         <ul id="folderList" class="folder-list"></ul>
         <p id="noFolders" class="muted">No folders chosen yet — add one to begin.</p>
+        <label class="toggle folder-option"><input type="checkbox" id="albumsFromFoldersToggle"> Create an album for each folder</label>
+        <p class="fineprint">
+          Drag folders or photos anywhere onto this window. Folders join the list
+          above; photos and videos upload right away. Albums are named after the
+          folder each file is in. Photos you upload on their own don't go into an album.
+        </p>
       </div>
 
       <div class="card">
@@ -113,10 +122,14 @@
           </div>
         </div>
         <ul id="uploadList" class="upload-list"></ul>
-        <p id="emptyQueue" class="muted">Nothing queued. Press “Back up now” to scan your folders.</p>
+        <p id="emptyQueue" class="muted">Nothing queued. Press “Back up now” to scan your folders, or upload photos.</p>
       </div>
     </section>
   </main>
+
+  <div id="dropOverlay" class="drop-overlay hidden" aria-hidden="true">
+    <div class="drop-target">Drop photos, videos, or folders</div>
+  </div>
 
   <footer>
     <button id="disconnectButton" class="danger hidden">Disconnect account</button>
