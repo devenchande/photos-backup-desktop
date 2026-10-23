@@ -10,6 +10,7 @@
 // HTTP 429 (per-minute quota), a queue-wide cooldown pauses *new* item starts
 // so one quota window does not burn the retry budget of every queued item.
 
+const path = require('path');
 const { GPMCClient, GPMCError } = require('./gpmc');
 const { signature } = require('./settings');
 const { eventLog } = require('./diagnostics');
@@ -32,6 +33,10 @@ const SKIP_REASON = 'Photos Backup closed unexpectedly more than once while '
   + 'preparing this file, so it was skipped to let the rest of the backup '
   + 'continue. Press Retry failed to try it again, and attach a diagnostic '
   + 'report if you report the problem.';
+
+// The album a file goes into: its immediate parent folder's name, or
+// "Uploads" (gotohp's fallback) for a file at a drive root.
+const folderAlbumName = (filePath) => path.basename(path.dirname(filePath)) || 'Uploads';
 
 const clampConcurrency = (n) => {
   const value = Number(n);
@@ -66,6 +71,9 @@ class UploadQueue {
     this.interrupted = this.markers.load();
     this.crashGuardSkipped = 0;
     this.recentFailures = [];
+    // Album creations in flight, by name, so items from one folder running
+    // side by side share one new album instead of each making their own.
+    this.albumCreations = new Map();
   }
 
   // Upstream setMaxConcurrent: applying a lower limit lets in-flight work
@@ -291,7 +299,7 @@ class UploadQueue {
   }
 
   isRunning(status) {
-    return ['exporting', 'hashing', 'checkingDuplicate', 'preparing', 'sending', 'finalizing'].includes(status);
+    return ['exporting', 'hashing', 'checkingDuplicate', 'preparing', 'sending', 'finalizing', 'addingToAlbum'].includes(status);
   }
 
   async runItem(item) {
@@ -318,6 +326,14 @@ class UploadQueue {
           this.emitSnapshot();
         },
       });
+      // Filed before the item counts as completed: if this fails the item is
+      // retried, and the retry's hash check finds the copy already uploaded.
+      if (this.settings.get('albumsFromFolders') && result.mediaKey) {
+        item.status = 'addingToAlbum';
+        item.detail = folderAlbumName(item.path);
+        this.emitSnapshot();
+        await this.addToFolderAlbum(item, result.mediaKey, GPMCClient.commitProfile(useQuota, storageSaver).model);
+      }
       item.status = result.outcome; // 'uploaded' | 'alreadyBackedUp'
       item.detail = null;
       item.error = null;
@@ -371,6 +387,42 @@ class UploadQueue {
     }
   }
 
+  // Put one media item into the album named after the file's folder, creating
+  // the album the first time that name is seen for this account.
+  async addToFolderAlbum(item, mediaKey, model) {
+    const name = folderAlbumName(item.path);
+    const pending = this.albumCreations.get(name);
+    if (pending) {
+      const key = await pending;
+      await this.client.addMediaToAlbum(key, [mediaKey], { model });
+      return;
+    }
+    const known = this.settings.albumKey(this.email, name);
+    if (known) {
+      try {
+        await this.client.addMediaToAlbum(known, [mediaKey], { model });
+        return;
+      } catch (error) {
+        // A permanent refusal most likely means the album was deleted in
+        // Google Photos; forget it and make a new one below. Transient and
+        // credential errors go to runItem's usual handling.
+        if (!(error instanceof GPMCError) || error.kind !== 'server' || error.retryable) throw error;
+        this.settings.saveAlbum(this.email, name, null);
+        eventLog().record('album', `Google refused a saved album, so a new one will be made: ${error.message}`, 'warning');
+      }
+    }
+    // The new album is created holding this item, as gotohp does.
+    const creation = this.client.createAlbum(name, [mediaKey], { model })
+      .then((key) => {
+        this.settings.saveAlbum(this.email, name, key);
+        eventLog().record('album', 'Created an album for a backed-up folder');
+        return key;
+      })
+      .finally(() => this.albumCreations.delete(name));
+    this.albumCreations.set(name, creation);
+    await creation;
+  }
+
   // Keep the newest failures and drop the oldest, so a long backup that goes
   // wrong in one way does not bury the one that went wrong differently
   // (upstream recordFailure). The filename stays out of the event log; the
@@ -397,6 +449,7 @@ class UploadQueue {
       case 'preparing': return 'reserving the upload';
       case 'sending': return 'uploading';
       case 'finalizing': return 'finishing it in Google Photos';
+      case 'addingToAlbum': return "adding it to its folder's album";
       default: return 'starting';
     }
   }
@@ -474,7 +527,7 @@ class UploadQueue {
 }
 
 module.exports = {
-  UploadQueue, backoffSeconds, clampConcurrency,
+  UploadQueue, backoffSeconds, clampConcurrency, folderAlbumName,
   DEFAULT_CONCURRENCY, MAX_ATTEMPTS,
   INTERRUPTED_PREPARATION_LIMIT, SKIP_REASON,
 };

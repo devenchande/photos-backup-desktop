@@ -45,12 +45,13 @@ const STATUS_LABELS = {
   preparing: 'Preparing',
   sending: 'Uploading',
   finalizing: 'Finalizing',
+  addingToAlbum: 'Adding to album',
   uploaded: 'Uploaded',
   alreadyBackedUp: 'Already in Google Photos',
   failed: 'Failed',
   cancelled: 'Cancelled',
 };
-const ACTIVE = new Set(['hashing', 'checkingDuplicate', 'preparing', 'sending', 'finalizing']);
+const ACTIVE = new Set(['hashing', 'checkingDuplicate', 'preparing', 'sending', 'finalizing', 'addingToAlbum']);
 
 function formatBytes(n) {
   if (!Number.isFinite(n) || n <= 0) return '0 B';
