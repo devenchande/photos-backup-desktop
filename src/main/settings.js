@@ -6,8 +6,8 @@
 
 const fs = require('fs');
 const path = require('path');
-const crypto = require('crypto');
 const { app } = require('electron');
+const { CompletedLedger, accountSlug } = require('./completedLedger');
 
 const DEFAULT_SETTINGS = {
   folders: [],
@@ -26,6 +26,15 @@ const DEFAULT_SETTINGS = {
   // back to the modification time. Google still prefers a date embedded in
   // the file; this only decides the date for files without one.
   dateFromFilename: true,
+  // Shows Re-upload a Folder…, which uploads files again even where Google
+  // already holds them, so they are committed under this app's quota-free
+  // device profile (iOS 0.3.9 Allow Re-upload). Off until asked for: it costs
+  // as much as the first backup, and Google may keep the copy it has.
+  allowReupload: false,
+  // Upload an iPhone Live Photo's still and video as one Live Photo: the
+  // video is attached to the still as its motion, as the iOS app does by
+  // default (0.3.9). Off, the video uploads as a separate video.
+  livePhotos: true,
 };
 
 function migrate(data) {
@@ -39,14 +48,6 @@ function migrate(data) {
 
 function settingsPath() {
   return path.join(app.getPath('userData'), 'settings.json');
-}
-
-function accountSlug(email) {
-  return crypto.createHash('sha256').update(email || 'unknown').digest('hex').slice(0, 16);
-}
-
-function completedPath(email) {
-  return path.join(app.getPath('userData'), `completed-${accountSlug(email)}.json`);
 }
 
 // Album names -> album media keys this app created for the account. Google's
@@ -67,6 +68,7 @@ class Settings {
     } catch {
       this.data = { ...DEFAULT_SETTINGS };
     }
+    this.completed = new CompletedLedger(app.getPath('userData'));
   }
 
   get(key) { return this.data[key]; }
@@ -77,31 +79,24 @@ class Settings {
     return this.data;
   }
 
-  loadCompleted(email) {
-    try {
-      return new Set(JSON.parse(fs.readFileSync(completedPath(email), 'utf8')).signatures || []);
-    } catch {
-      return new Set();
-    }
-  }
+  loadCompleted(email) { return this.completed.load(email); }
 
-  markCompleted(email, signatures) {
-    if (!signatures.length || !email) return;
-    const existing = this.loadCompleted(email);
-    for (const sig of signatures) existing.add(sig);
-    fs.writeFileSync(completedPath(email), JSON.stringify({ signatures: [...existing] }));
-  }
+  completedCount(email) { return this.completed.size(email); }
+
+  markCompleted(email, signatures) { this.completed.add(email, signatures); }
+
+  // Files chosen again by hand are checked with Google again (upstream iOS
+  // 3cfc6ca), so their record is dropped first.
+  forgetCompleted(email, signatures) { this.completed.remove(email, signatures); }
 
   isCompleted(email, item) {
-    return this.loadCompleted(email).has(signature(item));
+    return this.completed.has(email, signature(item));
   }
 
   // Upstream "Verify Backup": forget the account's completed record so a
   // re-check re-queues everything. The Google-side hash lookup settles what is
   // really in the cloud, so this only costs one hash + one RPC per file.
-  clearCompleted(email) {
-    try { fs.unlinkSync(completedPath(email)); } catch { /* ignore */ }
-  }
+  clearCompleted(email) { this.completed.clear(email); }
 
   loadAlbums(email) {
     try {

@@ -185,6 +185,40 @@ async function pickedFilesSkipAlbums() {
   console.log('test 7 OK: files uploaded on their own are not put into a folder album');
 }
 
+async function deletedAlbumReplacedOnce() {
+  const log = [];
+  const settings = fakeSettings({ albumsFromFolders: true, concurrency: 2 });
+  settings.albums.set('Trip', 'AF1Qip-deleted');
+  const client = stubClient(log);
+  // Both uploads find the saved album refused at about the same time.
+  client.addMediaToAlbum = async (key, keys) => {
+    await new Promise((r) => setTimeout(r, 10));
+    if (key === 'AF1Qip-deleted') throw new GPMCError('server', 'Google returned HTTP 400 during adding to an album.');
+    log.push(['add', key, ...keys]);
+  };
+  const queue = new UploadQueue({ credential: { authData: AUTH, email: 'u' }, settings, clientFactory: () => client });
+  await queue.enqueueScan([found(path.join('C:\\', 'Trip', 'a.jpg')), found(path.join('C:\\', 'Trip', 'b.jpg'))]);
+  await waitIdle(queue);
+  const creates = log.filter((e) => e[0] === 'create');
+  assert.strictEqual(creates.length, 1, 'one replacement album, not one per upload');
+  const key = settings.albums.get('Trip');
+  const filed = [...creates[0].slice(2), ...log.filter((e) => e[0] === 'add' && e[1] === key).flatMap((e) => e.slice(2))];
+  assert.deepStrictEqual(filed.sort(), ['mk-a.jpg', 'mk-b.jpg']);
+  assert.ok(queue.items.every((i) => i.status === 'uploaded'));
+  console.log('test 8 OK: uploads that both find their album deleted share one replacement');
+}
+
+async function unsavableRecordKeepsUpload() {
+  const settings = fakeSettings({ albumsFromFolders: true });
+  settings.saveAlbum = () => { throw new Error('disk full'); };
+  const queue = new UploadQueue({ credential: { authData: AUTH, email: 'u' }, settings, clientFactory: () => stubClient([]) });
+  await queue.enqueueScan([found(path.join('C:\\', 'Trip', 'a.jpg'))]);
+  await waitIdle(queue);
+  assert.strictEqual(queue.items[0].status, 'uploaded');
+  assert.strictEqual(settings.completed.size, 1);
+  console.log('test 9 OK: an album record that cannot be saved does not fail the upload');
+}
+
 (async () => {
   await wireFormat();
   albumName();
@@ -193,6 +227,8 @@ async function pickedFilesSkipAlbums() {
   await transientFailureIsNotCompleted();
   await disabled();
   await pickedFilesSkipAlbums();
+  await deletedAlbumReplacedOnce();
+  await unsavableRecordKeepsUpload();
   console.log('album tests passed');
   process.exit(0);
 })().catch((error) => { console.error(error); process.exit(1); });

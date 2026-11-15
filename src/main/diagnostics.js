@@ -281,6 +281,8 @@ function buildReport({ version, queue, settings, log, now = Date.now() } = {}) {
   field('Count against quota', settings?.get?.('useQuota'));
   field('Date from filename', settings?.get?.('dateFromFilename'));
   field('Albums from folders', settings?.get?.('albumsFromFolders'));
+  field('Allow re-upload', settings?.get?.('allowReupload'));
+  field('Live Photos', settings?.get?.('livePhotos'));
   field('Commit profile', `device ${profile.model}, quality code ${profile.quality} (${settings?.get?.('storageSaver') ? 'Storage Saver' : 'original'})`);
 
   if (info) {

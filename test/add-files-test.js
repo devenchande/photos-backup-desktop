@@ -10,6 +10,7 @@ const os = require('os');
 const path = require('path');
 const { inspectPaths } = require('../src/main/mediaScanner');
 const { UploadQueue } = require('../src/main/uploadQueue');
+const { signature } = require('../src/main/settings');
 
 const AUTH = 'androidId=a&client_sig=b&callerSig=c&device_country=us&Email=user%40example.com'
   + '&google_play_services_version=1&lang=en&oauth2_foreground=1&sdk_version=28&service=s&Token=t';
@@ -63,9 +64,74 @@ async function cancelReachesEarlierUploads() {
   console.log('test 2 OK: Cancel still stops uploads that were running when more files were added');
 }
 
+function recordingSettings(data = {}) {
+  const completed = new Set();
+  return {
+    completed,
+    get: (k) => data[k],
+    loadCompleted: () => new Set(completed),
+    markCompleted: (_e, sigs) => sigs.forEach((s) => completed.add(s)),
+    forgetCompleted: (_e, sigs) => sigs.forEach((s) => completed.delete(s)),
+  };
+}
+
+const waitIdle = async (queue) => {
+  for (let i = 0; i < 500 && !queue.isIdle; i += 1) await new Promise((r) => setTimeout(r, 10));
+};
+
+async function chosenFilesAreRechecked() {
+  const calls = [];
+  const client = { upload: async (p, opts) => { calls.push({ p, force: opts.forceUpload }); return { outcome: 'alreadyBackedUp', mediaKey: 'k' }; } };
+  const settings = recordingSettings();
+  const queue = new UploadQueue({ credential: { authData: AUTH, email: 'u' }, settings, clientFactory: () => client });
+  const file = { path: path.join(os.tmpdir(), 'chosen.jpg'), filename: 'chosen.jpg', size: 1, mtimeMs: 1000 };
+
+  // A folder scan skips a file recorded as backed up...
+  settings.completed.add(signature(file));
+  assert.strictEqual((await queue.enqueueScan([file])).queued, 0);
+  // ...but choosing it by hand checks it with Google again.
+  assert.deepStrictEqual(await queue.enqueueChosen([file], { skipAlbum: true }), { queued: 1, alreadyDone: 0 });
+  await waitIdle(queue);
+  assert.strictEqual(calls.length, 1);
+
+  // Choosing it again requeues the finished row instead of adding another.
+  assert.deepStrictEqual(await queue.enqueueChosen([file], { skipAlbum: true }), { queued: 1, alreadyDone: 0 });
+  await waitIdle(queue);
+  assert.strictEqual(queue.items.length, 1);
+  assert.strictEqual(calls.length, 2);
+  assert.strictEqual(calls[1].force, false);
+  console.log('test 3 OK: picked and dropped files are checked again even when recorded as done');
+}
+
+async function reuploadMarksRows() {
+  const calls = [];
+  const client = { upload: async (p, opts) => {
+    calls.push({ p: path.basename(p), force: opts.forceUpload });
+    return opts.forceUpload
+      ? { outcome: 'uploaded', mediaKey: p.endsWith('same.jpg') ? 'old' : 'new', previousKey: 'old' }
+      : { outcome: 'alreadyBackedUp', mediaKey: 'old' };
+  } };
+  const settings = recordingSettings();
+  const queue = new UploadQueue({ credential: { authData: AUTH, email: 'u' }, settings, clientFactory: () => client });
+  const file = (name) => ({ path: path.join(os.tmpdir(), name), filename: name, size: 1, mtimeMs: 1000 });
+  await queue.enqueueScan([file('same.jpg')]); // backed up normally first
+  await waitIdle(queue);
+  await queue.enqueueChosen([file('same.jpg'), file('fresh.jpg')], { forceUpload: true });
+  await waitIdle(queue);
+  assert.deepStrictEqual(calls.map((c) => c.force), [false, true, true]);
+  const row = (name) => queue.items.find((i) => i.filename === name);
+  assert.strictEqual(row('same.jpg').detail, 'Re-uploaded; Google kept the copy it already had');
+  assert.strictEqual(row('fresh.jpg').detail, 'Re-uploaded as a new item; the earlier copy may still use storage');
+  assert.ok(queue.items.every((i) => i.forceUpload === false), 'the mark is cleared once done');
+  assert.strictEqual(settings.completed.size, 2);
+  console.log('test 4 OK: re-upload forces each file and reports what Google answered');
+}
+
 (async () => {
   await sortsPaths();
   await cancelReachesEarlierUploads();
+  await chosenFilesAreRechecked();
+  await reuploadMarksRows();
   console.log('add files tests passed');
   process.exit(0);
 })().catch((error) => { console.error(error); process.exit(1); });

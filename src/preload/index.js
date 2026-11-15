@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('photosBackup', {
   removeFolder: (folder) => ipcRenderer.invoke('remove-folder', folder),
   updateSettings: (patch) => ipcRenderer.invoke('update-settings', patch),
   runBackup: () => ipcRenderer.invoke('run-backup'),
+  reuploadFolder: () => ipcRenderer.invoke('reupload-folder'),
+  reuploadFiles: () => ipcRenderer.invoke('reupload-files'),
   recheckBackup: () => ipcRenderer.invoke('recheck-backup'),
   pause: () => ipcRenderer.invoke('queue-pause'),
   resume: () => ipcRenderer.invoke('queue-resume'),

@@ -416,29 +416,23 @@ class GPMCClient {
     await this.rpc(GPMCClient.ADD_TO_ALBUM_METHOD, body, { ext: true, operation: 'adding to an album' });
   }
 
-  // SHA-1 the file, ask whether Google already holds it, and otherwise
-  // upload and commit it. Phases mirror the iOS UploadPhase enum.
-  async upload(filePath, { filename = path.basename(filePath), modified = null, useQuota = true, saver = false, onPhase = () => {}, signal } = {}) {
-    const stat = fs.statSync(filePath);
-    if (!stat.size) throw new GPMCError('malformed', 'That item is empty; there is nothing to upload.');
+  // `PhotosReadItemsByContentHash`: the media key Google holds for a SHA-1,
+  // or null. A Live Photo motion is looked up with sha1MediaType PhodeoMovie
+  // (field 5 = 2); it then resolves only when it is attached to its still
+  // (iOS remoteMediaKey(sha1:asLivePhotoMotion:)).
+  async remoteMediaKey(hash, { asLivePhotoMotion = false } = {}) {
+    const query = Buffer.concat([bytesField(1, hash), asLivePhotoMotion ? intField(5, 2) : Buffer.alloc(0)]);
+    const check = bytesField(1, Buffer.concat([bytesField(1, query), bytesField(2, Buffer.alloc(0))]));
+    return stringAt([1, 2, 2, 1], await this.rpc(GPMCClient.HASH_CHECK_METHOD, check));
+  }
 
-    onPhase({ phase: 'hashing', fraction: 0 });
-    const { hash, size } = await hashFile(filePath, (fraction) => onPhase({ phase: 'hashing', fraction }), signal);
-
-    onPhase({ phase: 'checkingDuplicate' });
-    const check = bytesField(1, Buffer.concat([
-      bytesField(1, bytesField(1, hash)),
-      bytesField(2, Buffer.alloc(0)),
-    ]));
-    const existing = await this.rpc(GPMCClient.HASH_CHECK_METHOD, check);
-    const existingKey = stringAt([1, 2, 2, 1], existing);
-    if (existingKey) return { outcome: 'alreadyBackedUp', mediaKey: existingKey };
-
+  // Reserve an upload and stream the file; returns the validated receipt.
+  async transfer(filePath, { hash, size, onPhase, signal }) {
     onPhase({ phase: 'preparing' });
     const prepareBody = Buffer.concat([
       intField(1, 2), intField(2, 2), intField(3, 1), intField(4, 3), intField(7, BigInt(size)),
     ]);
-    const { response: prepared, body: _prepareBody } = await this.request(GPMCClient.UPLOAD_ENDPOINT, {
+    const { response: prepared } = await this.request(GPMCClient.UPLOAD_ENDPOINT, {
       body: prepareBody,
       headers: {
         'X-Goog-Hash': `sha1=${hash.toString('base64')}`,
@@ -469,9 +463,16 @@ class GPMCClient {
     // or unrelated protobuf here would otherwise fail later as HTTP 400.
     const receipt = await checkedStatus(receiptResponse, 'file transfer');
     validateReceipt(receipt);
+    return receipt;
+  }
 
+  // `PhotosCreateMediaItems` for one transferred file; returns its media key.
+  // `pairedStillHash` commits the file as the Live Photo motion of the still
+  // with that hash: blueprint field 9 reconcileInfo {2: Phodeo (1), 3: the
+  // still's SHA-1}, as the Google Photos iOS app attaches motion to a still
+  // already in the account (iOS GPMCClient.commit, gotohp ReconcileLivePhoto).
+  async commit({ receipt, filename, hash, date, useQuota, saver, pairedStillHash = null, onPhase }) {
     onPhase({ phase: 'finalizing' });
-    const date = modified ?? stat.mtime;
     const stamp = BigInt(Math.max(0, Math.floor(date.getTime() / 1000)));
     const metadata = Buffer.concat([
       bytesField(1, receipt),
@@ -480,6 +481,7 @@ class GPMCClient {
       bytesField(4, Buffer.concat([intField(1, stamp), intField(2, 46000000)])),
       intField(7, saver ? 1 : 3),
       intField(10, 1),
+      pairedStillHash ? bytesField(9, Buffer.concat([intField(2, 1), bytesField(3, pairedStillHash)])) : Buffer.alloc(0),
     ]);
     const device = Buffer.concat([
       stringField(3, GPMCClient.commitProfile(useQuota, saver).model),
@@ -501,7 +503,59 @@ class GPMCClient {
     }
     const mediaKey = stringAt([1, 3, 1], committed);
     if (!mediaKey) throw new GPMCError('malformed', 'Google rejected the upload during finalization.');
-    return { outcome: 'uploaded', mediaKey };
+    return mediaKey;
+  }
+
+  // SHA-1 the file, ask whether Google already holds it, and otherwise
+  // upload and commit it. Phases mirror the iOS UploadPhase enum.
+  // With `forceUpload` the file is sent even when Google already holds it
+  // (iOS 0.3.9 re-upload). The lookup still runs, so the result can say
+  // whether Google answered with the key it already had (`previousKey`).
+  // The result carries the file's `hash`, which a Live Photo's motion needs.
+  async upload(filePath, { filename = path.basename(filePath), modified = null, useQuota = true, saver = false, forceUpload = false, onPhase = () => {}, signal } = {}) {
+    const stat = fs.statSync(filePath);
+    if (!stat.size) throw new GPMCError('malformed', 'That item is empty; there is nothing to upload.');
+
+    onPhase({ phase: 'hashing', fraction: 0 });
+    const { hash, size } = await hashFile(filePath, (fraction) => onPhase({ phase: 'hashing', fraction }), signal);
+
+    onPhase({ phase: 'checkingDuplicate' });
+    const existingKey = await this.remoteMediaKey(hash);
+    if (existingKey && !forceUpload) return { outcome: 'alreadyBackedUp', mediaKey: existingKey, hash };
+
+    const receipt = await this.transfer(filePath, { hash, size, onPhase, signal });
+    const mediaKey = await this.commit({
+      receipt, filename, hash, date: modified ?? stat.mtime, useQuota, saver, onPhase,
+    });
+    return { outcome: 'uploaded', mediaKey, previousKey: existingKey || null, hash };
+  }
+
+  // Attach a Live Photo's motion (its MOV) to the still with `stillHash`,
+  // which must already be in the account: the queue uploads the still first.
+  // Outcomes:
+  //   alreadyAttached  the video already resolves as this Live Photo's motion
+  //   standalone       the video is already in Google Photos as a video of its
+  //                    own; gotohp leaves that alone, since joining a separate
+  //                    video to a still is not a path anyone has verified
+  //   attached         uploaded and committed as the still's motion
+  async uploadMotion(filePath, { stillHash, filename = path.basename(filePath), modified = null, useQuota = true, saver = false, onPhase = () => {}, signal } = {}) {
+    const stat = fs.statSync(filePath);
+    if (!stat.size) throw new GPMCError('malformed', 'The Live Photo video is empty.');
+
+    onPhase({ phase: 'hashing', fraction: 0 });
+    const { hash, size } = await hashFile(filePath, (fraction) => onPhase({ phase: 'hashing', fraction }), signal);
+
+    onPhase({ phase: 'checkingDuplicate' });
+    const attachedKey = await this.remoteMediaKey(hash, { asLivePhotoMotion: true });
+    if (attachedKey) return { outcome: 'alreadyAttached', mediaKey: attachedKey };
+    const standaloneKey = await this.remoteMediaKey(hash);
+    if (standaloneKey) return { outcome: 'standalone', mediaKey: standaloneKey };
+
+    const receipt = await this.transfer(filePath, { hash, size, onPhase, signal });
+    const mediaKey = await this.commit({
+      receipt, filename, hash, date: modified ?? stat.mtime, useQuota, saver, pairedStillHash: stillHash, onPhase,
+    });
+    return { outcome: 'attached', mediaKey };
   }
 }
 

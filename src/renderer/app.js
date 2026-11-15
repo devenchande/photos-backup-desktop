@@ -24,6 +24,11 @@ const els = {
   storageSaverToggle: document.getElementById('storageSaverToggle'),
   useQuotaToggle: document.getElementById('useQuotaToggle'),
   dateFromFilenameToggle: document.getElementById('dateFromFilenameToggle'),
+  allowReuploadToggle: document.getElementById('allowReuploadToggle'),
+  livePhotosToggle: document.getElementById('livePhotosToggle'),
+  reuploadButton: document.getElementById('reuploadButton'),
+  reuploadFilesButton: document.getElementById('reuploadFilesButton'),
+  moreRows: document.getElementById('moreRows'),
   concurrencySelect: document.getElementById('concurrencySelect'),
   summary: document.getElementById('summary'),
   scanNote: document.getElementById('scanNote'),
@@ -36,7 +41,7 @@ const els = {
 
 const state = {
   account: { status: 'disconnected' },
-  settings: { folders: [], storageSaver: false, useQuota: false, dateFromFilename: true, albumsFromFolders: true, concurrency: 2 },
+  settings: { folders: [], storageSaver: false, useQuota: false, dateFromFilename: true, albumsFromFolders: true, allowReupload: false, livePhotos: true, concurrency: 2 },
   snapshot: null,
   filter: 'all',
 };
@@ -102,6 +107,16 @@ function render() {
   els.useQuotaToggle.checked = !!state.settings.useQuota;
   els.dateFromFilenameToggle.checked = !!state.settings.dateFromFilename;
   els.albumsFromFoldersToggle.checked = !!state.settings.albumsFromFolders;
+  els.allowReuploadToggle.checked = !!state.settings.allowReupload;
+  els.livePhotosToggle.checked = !!state.settings.livePhotos;
+  // Re-upload only helps uploads that go up under the quota-free profile.
+  for (const [button, what] of [[els.reuploadFilesButton, 'photos and videos'], [els.reuploadButton, 'a folder']]) {
+    button.classList.toggle('hidden', !state.settings.allowReupload);
+    button.disabled = !!state.settings.useQuota;
+    button.title = state.settings.useQuota
+      ? 'Turn off Count against storage quota first: re-uploading under it would still use your storage.'
+      : `Upload ${what} again, including files already in Google Photos.`;
+  }
   els.concurrencySelect.value = String(state.settings.concurrency || 2);
 
   // Queue controls
@@ -157,9 +172,21 @@ function render() {
     : items.filter((i) => i.status === 'failed' || i.status === 'cancelled');
   els.emptyQueue.classList.toggle('hidden', filtered.length > 0);
   els.uploadList.innerHTML = '';
-  for (const item of filtered.slice(0, 400)) {
+  const shown = filtered.slice(0, 400);
+  for (const item of shown) {
     els.uploadList.append(renderItem(item));
   }
+  // A large queue arrives as a window of rows; say how many are left out.
+  const inFilter = !counts ? 0
+    : state.filter === 'all' ? counts.total
+    : state.filter === 'active' ? counts.active + counts.waiting
+    : state.filter === 'uploaded' ? counts.uploaded + counts.alreadyBackedUp
+    : counts.failed + counts.cancelled;
+  const hidden = Math.max(0, inFilter - shown.length);
+  els.moreRows.classList.toggle('hidden', hidden === 0);
+  els.moreRows.textContent = hidden
+    ? `${hidden.toLocaleString()} more not shown: running files, the next ones waiting and the latest finished are listed.`
+    : '';
 }
 
 function showNote(text, sticky = false) {
@@ -184,7 +211,8 @@ function renderItem(item) {
   row1.className = 'row1';
   const name = document.createElement('span');
   name.className = 'filename';
-  name.textContent = item.filename;
+  // A Live Photo row stands for its photo and its video.
+  name.textContent = item.motionFilename ? `${item.filename} + ${item.motionFilename} (Live Photo)` : item.filename;
   name.title = item.path;
   const status = document.createElement('span');
   status.className = `status ${item.status}`;
@@ -284,6 +312,8 @@ const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 // One sentence for what an upload or drop did.
 function describeAdded(result) {
+  if (result?.error === 'reupload-off') return 'Turn on Allow re-upload first.';
+  if (result?.error === 'reupload-quota') return 'Turn off Count against storage quota before re-uploading.';
   if (result?.error) return 'Could not add them: connect an account first.';
   const bits = [];
   if (result.foldersAdded) bits.push(`added ${plural(result.foldersAdded, 'folder')} to back up`);
@@ -294,6 +324,15 @@ function describeAdded(result) {
   const text = bits.join('; ');
   return `${text[0].toUpperCase()}${text.slice(1)}.`;
 }
+
+async function reuploadFlow(start) {
+  const result = await start();
+  if (result?.canceled) return;
+  showNote(describeAdded(result), true);
+  render();
+}
+els.reuploadButton.onclick = () => reuploadFlow(window.photosBackup.reuploadFolder);
+els.reuploadFilesButton.onclick = () => reuploadFlow(window.photosBackup.reuploadFiles);
 
 els.uploadPhotosButton.onclick = async () => {
   const result = await window.photosBackup.selectFiles();
@@ -350,6 +389,14 @@ els.useQuotaToggle.onchange = async () => {
 };
 els.dateFromFilenameToggle.onchange = async () => {
   state.settings = await window.photosBackup.updateSettings({ dateFromFilename: els.dateFromFilenameToggle.checked });
+  render();
+};
+els.livePhotosToggle.onchange = async () => {
+  state.settings = await window.photosBackup.updateSettings({ livePhotos: els.livePhotosToggle.checked });
+  render();
+};
+els.allowReuploadToggle.onchange = async () => {
+  state.settings = await window.photosBackup.updateSettings({ allowReupload: els.allowReuploadToggle.checked });
   render();
 };
 els.albumsFromFoldersToggle.onchange = async () => {
