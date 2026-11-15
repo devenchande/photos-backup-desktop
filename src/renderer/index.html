@@ -54,21 +54,27 @@
         </div>
         <ul id="folderList" class="folder-list"></ul>
         <p id="noFolders" class="muted">No folders chosen yet — add one to begin.</p>
-        <label class="toggle folder-option"><input type="checkbox" id="albumsFromFoldersToggle"> Create an album for each folder</label>
-        <p class="fineprint">
-          Drag folders or photos anywhere onto this window. Folders join the list
-          above; photos and videos upload right away. Albums are named after the
-          folder each file is in. Photos you upload on their own don't go into an album.
-        </p>
+        <label class="toggle folder-option" title="Put each file in a Google Photos album named after its folder."><input type="checkbox" id="albumsFromFoldersToggle"> Create an album for each folder</label>
+        <details class="help">
+          <summary>How adding works</summary>
+          <ul>
+            <li><strong>Drag and drop</strong> anywhere on this window: folders join the list, photos upload right away.</li>
+            <li><strong>Upload Photos…</strong> uploads chosen files once; it doesn't add a folder.</li>
+            <li><strong>Albums</strong> are named after the folder each file is in.</li>
+            <li>Photos added on their own don't go into an album.</li>
+          </ul>
+        </details>
       </div>
 
       <div class="card">
         <div class="card-head">
           <h2>Backup</h2>
           <div class="toggles">
-            <label class="toggle"><input type="checkbox" id="storageSaverToggle"> Storage Saver</label>
-            <label class="toggle"><input type="checkbox" id="useQuotaToggle"> Count against storage quota</label>
-            <label class="toggle"><input type="checkbox" id="dateFromFilenameToggle"> Date from filename</label>
+            <label class="toggle" title="Ask Google Photos to make files smaller."><input type="checkbox" id="storageSaverToggle"> Storage Saver</label>
+            <label class="toggle" title="Off: uploads don't use your Google storage."><input type="checkbox" id="useQuotaToggle"> Count against storage quota</label>
+            <label class="toggle" title="Date files by a date in their name when they have none inside."><input type="checkbox" id="dateFromFilenameToggle"> Date from filename</label>
+            <label class="toggle" title="Upload an iPhone photo and its video as one Live Photo."><input type="checkbox" id="livePhotosToggle"> Live Photos</label>
+            <label class="toggle" title="Show buttons that upload files again, even ones Google already has."><input type="checkbox" id="allowReuploadToggle"> Allow re-upload</label>
             <label class="toggle">Simultaneous uploads
               <select id="concurrencySelect" class="concurrency">
                 <option>1</option><option>2</option><option>3</option><option>4</option>
@@ -78,18 +84,36 @@
             </label>
           </div>
         </div>
-        <p class="fineprint" id="qualityNote">
-          Storage Saver asks Google Photos to reduce file size. With Count against
-          storage quota off, uploads identify as an older Pixel phone so they don't
-          use your Google storage; the Google Photos app may then label them
-          “Storage saver” even though the original file was kept. The file size, or
-          Google Photos on the web, shows the real quality.
-          Date from filename dates a file by a date in its name, such as
-          IMG_20240709_182027.jpg, when the file has no date of its own inside it.
-        </p>
+        <details class="help">
+          <summary>What these options do</summary>
+          <ul>
+            <li><strong>Storage Saver:</strong> Google Photos makes files smaller.</li>
+            <li><strong>Count against storage quota:</strong> off, uploads don't use your Google storage.
+              <ul>
+                <li>The Google Photos app may still label them “Storage saver”; the file size shows the real quality.</li>
+              </ul>
+            </li>
+            <li><strong>Date from filename:</strong> dates a file from its name (IMG_20240709_182027.jpg) when it has no date inside.</li>
+            <li><strong>Live Photos:</strong> an iPhone photo and its video (IMG_1234.HEIC + .MOV) upload as one Live Photo.
+              <ul>
+                <li>To copy them from an iPhone: in its Photos settings set <em>Transfer to Mac or PC</em> to <em>Keep Originals</em>, then import over USB.</li>
+                <li>Off, the video uploads as a separate video.</li>
+              </ul>
+            </li>
+            <li><strong>Allow re-upload:</strong> shows Re-upload Photos… and Re-upload a Folder….
+              <ul>
+                <li>Uploads files again, even ones Google already has, so they can move to the free quota.</li>
+                <li>Only helps with Count against storage quota off.</li>
+                <li>Google may keep its old copy: try a few files and compare your storage.</li>
+              </ul>
+            </li>
+          </ul>
+        </details>
         <div class="actions">
           <button id="backupButton" class="primary">Back up now</button>
           <button id="recheckButton" class="secondary">Re-check backups</button>
+          <button id="reuploadFilesButton" class="secondary hidden">Re-upload Photos…</button>
+          <button id="reuploadButton" class="secondary hidden">Re-upload a Folder…</button>
           <button id="pauseButton" class="secondary" disabled>Pause</button>
           <button id="cancelButton" class="secondary" disabled>Cancel</button>
           <button id="retryButton" class="secondary" disabled>Retry failed</button>
@@ -103,12 +127,10 @@
           <h2>Support</h2>
           <button id="copyDiagnosticsButton" class="secondary">Copy Diagnostic Report</button>
         </div>
-        <p class="fineprint">
-          A redacted summary of this app's decisions, queue, and event timeline —
-          credentials, addresses, filenames, and URLs are excluded. Nothing is
-          sent anywhere; the report is copied to your clipboard to paste wherever
-          you like.
-        </p>
+        <ul class="fineprint points">
+          <li>Copies a summary of what the app did to your clipboard; nothing is sent anywhere.</li>
+          <li>Credentials, addresses, filenames and URLs are left out.</li>
+        </ul>
       </div>
 
       <div class="card uploads-card">
@@ -122,6 +144,7 @@
           </div>
         </div>
         <ul id="uploadList" class="upload-list"></ul>
+        <p id="moreRows" class="muted hidden"></p>
         <p id="emptyQueue" class="muted">Nothing queued. Press “Back up now” to scan your folders, or upload photos.</p>
       </div>
     </section>

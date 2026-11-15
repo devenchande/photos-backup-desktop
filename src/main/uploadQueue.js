@@ -23,7 +23,28 @@ const MIN_CONCURRENCY = 1;
 const MAX_CONCURRENCY = 10;
 // Upstream: scheduleRetry(after: min(30, pow(2, attempt))) — 2s, 4s, 8s.
 const backoffSeconds = (attempt) => Math.min(30, 2 ** attempt);
+// A 429 pauses new starts for a minute, doubling while Google keeps refusing,
+// up to ten times that, and back to a minute after the next success
+// (upstream iOS d9b7afa).
 const QUOTA_COOLDOWN_MS = 60000;
+const QUOTA_COOLDOWN_GROWTH_LIMIT = 10;
+// Above this many rows a snapshot carries only a window of them: everything
+// running, failed rows up to a cap, the next waiting ones and the latest
+// finished ones. The counts still cover every row (upstream iOS 6a9f02a).
+const SNAPSHOT_ALL_ROWS = 400;
+const SNAPSHOT_WAITING_ROWS = 50;
+const SNAPSHOT_FAILED_ROWS = 200;
+const SNAPSHOT_FINISHED_ROWS = 100;
+const DONE = new Set(['uploaded', 'alreadyBackedUp']);
+const MOTION_NOTES = {
+  attached: 'Live Photo motion attached',
+  alreadyAttached: 'Live Photo motion already attached',
+  standalone: 'Its video is already in Google Photos as a separate video, so the motion was not attached',
+};
+// The completed-record entries a row stands for: a Live Photo is its still
+// and its motion.
+const signatures = (item) => (item.motion ? [signature(item), signature(item.motion)] : [signature(item)]);
+const FINISHED = new Set(['uploaded', 'alreadyBackedUp', 'failed', 'cancelled']);
 // Upstream recentFailureLimit: the newest failures the report lists.
 const RECENT_FAILURE_LIMIT = 10;
 // A file the process has died on this many times while preparing it is
@@ -63,6 +84,8 @@ class UploadQueue {
     this.haltReason = null;       // set when the credential is refused / storage is full
     this.cooldownUntil = 0;       // set when Google answers 429
     this.cooldownReason = null;
+    this.quotaStrikes = 0;        // 429 pauses since the last success
+    this.recentlyDone = [];       // newest finished rows, for the snapshot window
     this.retryTimers = new Set();
     // Crash-loop guard (upstream 0.3.6): markers name the files a previous
     // process died preparing; counters remember how often each file has done
@@ -153,6 +176,50 @@ class UploadQueue {
     this.emitSnapshot();
     this.pump();
     return { queued: batch.length, remaining: Math.max(0, pending.length - batch.length) };
+  }
+
+  // Files the user chose by hand: picked, dropped, or a folder to re-upload.
+  // They are checked with Google again even when recorded as backed up
+  // (upstream iOS 3cfc6ca), and with `forceUpload` they are uploaded again
+  // even where Google already holds them (iOS 0.3.9 re-upload). Rows already
+  // in the queue are requeued or marked rather than duplicated; rows running
+  // now are left to finish.
+  async enqueueChosen(found, { skipAlbum = false, forceUpload = false } = {}) {
+    this.cancelRequested = false;
+    if (this.abort.signal.aborted) this.abort = new AbortController();
+    this.settings.forgetCompleted?.(this.email, found.flatMap(signatures));
+    const rows = new Map(this.items.map((item) => [item.path, item]));
+    const fresh = [];
+    let requeued = 0;
+    let running = 0;
+    for (const file of found) {
+      const row = rows.get(file.path);
+      if (!row) {
+        fresh.push({ ...file, skipAlbum, forceUpload });
+      } else if (row.status === 'waiting' || FINISHED.has(row.status)) {
+        Object.assign(row, {
+          ...file,
+          status: 'waiting',
+          detail: null,
+          error: null,
+          attempts: 0,
+          retryable: undefined,
+          skipAlbum: skipAlbum && !!row.skipAlbum,
+          forceUpload: forceUpload || (row.status === 'waiting' && !!row.forceUpload),
+        });
+        this.counters.clear(signature(row));
+        requeued += 1;
+      } else {
+        running += 1;
+      }
+    }
+    const { queued } = fresh.length ? await this.enqueueScan(fresh) : { queued: 0 };
+    if (requeued) {
+      eventLog().record('queue', `Queued ${requeued} chosen file${requeued === 1 ? '' : 's'} again`);
+      this.emitSnapshot();
+      this.pump();
+    }
+    return { queued: queued + requeued, alreadyDone: running + (fresh.length - queued) };
   }
 
   retryFailed() {
@@ -248,10 +315,12 @@ class UploadQueue {
         halted: this.haltReason,
         cooldownRemainingMs: this.cooldownUntil > Date.now() ? this.cooldownUntil - Date.now() : 0,
         cooldownReason: this.cooldownUntil > Date.now() ? this.cooldownReason : null,
-        items: this.items.map((item) => ({
+        limited: this.items.length > SNAPSHOT_ALL_ROWS,
+        items: this.snapshotRows().map((item) => ({
           path: item.path,
           filename: item.filename,
-          size: item.size,
+          size: item.size + (item.motion?.size || 0),
+          motionFilename: item.motion?.filename || null,
           status: item.status,
           detail: item.detail || null,
           error: item.error || null,
@@ -259,6 +328,33 @@ class UploadQueue {
         })),
       });
     }, 100);
+  }
+
+  // The rows a snapshot carries, in queue order. Small queues send them all; a
+  // large one sends a window, so a big re-check does not ship and redraw tens
+  // of thousands of rows several times a second.
+  snapshotRows() {
+    if (this.items.length <= SNAPSHOT_ALL_ROWS) return this.items;
+    const chosen = new Set();
+    let waiting = 0;
+    let failed = 0;
+    for (const item of this.items) {
+      if (item.status === 'waiting') {
+        if (waiting < SNAPSHOT_WAITING_ROWS) { chosen.add(item); waiting += 1; }
+      } else if (item.status === 'failed' || item.status === 'cancelled') {
+        if (failed < SNAPSHOT_FAILED_ROWS) { chosen.add(item); failed += 1; }
+      } else if (!DONE.has(item.status)) {
+        chosen.add(item); // running
+      }
+    }
+    for (const item of this.recentlyDone) if (DONE.has(item.status)) chosen.add(item);
+    return this.items.filter((item) => chosen.has(item));
+  }
+
+  noteDone(item) {
+    this.recentlyDone = this.recentlyDone.filter((other) => other !== item);
+    this.recentlyDone.push(item);
+    if (this.recentlyDone.length > SNAPSHOT_FINISHED_ROWS) this.recentlyDone.shift();
   }
 
   // Upstream pump(): start queued work while slots are free, the queue is not
@@ -308,29 +404,24 @@ class UploadQueue {
   async runItem(item) {
     const storageSaver = !!this.settings.get('storageSaver');
     const useQuota = !!this.settings.get('useQuota');
+    const modified = this.settings.get('dateFromFilename')
+      ? captureDate(item.filename, item.mtimeMs)
+      : new Date(item.mtimeMs);
     try {
       item.attempts += 1;
       const result = await this.client.upload(item.path, {
         filename: item.filename,
-        modified: this.settings.get('dateFromFilename')
-          ? captureDate(item.filename, item.mtimeMs)
-          : new Date(item.mtimeMs),
+        modified,
         useQuota,
         saver: storageSaver,
+        forceUpload: !!item.forceUpload,
         signal: this.abort.signal,
-        onPhase: (phase) => {
-          if (this.abort.signal.aborted) return;
-          item.status = phase.phase === 'sending' ? 'sending'
-            : phase.phase === 'hashing' ? 'hashing'
-            : phase.phase === 'checkingDuplicate' ? 'checkingDuplicate'
-            : phase.phase === 'preparing' ? 'preparing'
-            : 'finalizing';
-          item.detail = phase.phase === 'hashing' ? `${Math.round((phase.fraction || 0) * 100)}% hashed`
-            : phase.phase === 'sending' ? `${this.formatBytes(phase.sent)} / ${this.formatBytes(phase.total)}`
-            : null;
-          this.emitSnapshot();
-        },
+        onPhase: (phase) => this.showPhase(item, phase),
       });
+      // A Live Photo's motion goes on once its still is in the account.
+      const motionNote = item.motion
+        ? await this.attachMotion(item, result, { modified, useQuota, saver: storageSaver })
+        : null;
       // Filed before the item counts as completed: if this fails the item is
       // retried, and the retry's hash check finds the copy already uploaded.
       if (this.settings.get('albumsFromFolders') && result.mediaKey && !item.skipAlbum) {
@@ -339,10 +430,19 @@ class UploadQueue {
         this.emitSnapshot();
         await this.addToFolderAlbum(item, result.mediaKey, GPMCClient.commitProfile(useQuota, storageSaver).model);
       }
-      item.status = result.outcome; // 'uploaded' | 'alreadyBackedUp'
-      item.detail = null;
+      // 'uploaded' | 'alreadyBackedUp'; a still found in the account counts as
+      // uploaded when its motion went up just now.
+      item.status = motionNote === MOTION_NOTES.attached ? 'uploaded' : result.outcome;
+      const reuploadNote = item.forceUpload ? this.constructor.reuploadNote(result) : null;
+      item.detail = [reuploadNote, motionNote].filter(Boolean).join(' · ') || null;
       item.error = null;
-      this.settings.markCompleted(this.email, [signature(item)]);
+      if (item.forceUpload) {
+        eventLog().record('reupload', `A re-upload finished: ${reuploadNote}`);
+        item.forceUpload = false;
+      }
+      this.quotaStrikes = 0;
+      this.noteDone(item);
+      this.settings.markCompleted(this.email, signatures(item));
       // It made it through; any interruption count is stale.
       this.counters.clear(signature(item));
       this.emitSnapshot();
@@ -364,9 +464,14 @@ class UploadQueue {
       } else {
         const retryable = error instanceof GPMCError && error.retryable;
         if (error instanceof GPMCError && error.statusCode === 429) {
+          // A rate limit says nothing about this file, so it gets its attempt
+          // back and waits out the queue-wide pause (upstream iOS d9b7afa).
+          item.attempts -= 1;
+          item.status = 'waiting';
+          item.error = null;
+          item.detail = "waiting out Google's rate limit";
           this.noteQuotaRejection();
-        }
-        if (retryable && item.attempts < MAX_ATTEMPTS) {
+        } else if (retryable && item.attempts < MAX_ATTEMPTS) {
           item.status = 'waiting';
           item.error = null;
           item.detail = `attempt ${item.attempts} failed (${this.shortReason(error)}); retrying`;
@@ -392,6 +497,53 @@ class UploadQueue {
     }
   }
 
+  // Reflect a client phase on the row. `prefix` marks the Live Photo motion's
+  // phases, which run on the same row after the still's.
+  showPhase(item, phase, prefix = '') {
+    if (this.abort.signal.aborted) return;
+    item.status = phase.phase === 'sending' ? 'sending'
+      : phase.phase === 'hashing' ? 'hashing'
+      : phase.phase === 'checkingDuplicate' ? 'checkingDuplicate'
+      : phase.phase === 'preparing' ? 'preparing'
+      : 'finalizing';
+    const detail = phase.phase === 'hashing' ? `${Math.round((phase.fraction || 0) * 100)}% hashed`
+      : phase.phase === 'sending' ? `${this.formatBytes(phase.sent)} / ${this.formatBytes(phase.total)}`
+      : null;
+    item.detail = prefix ? `${prefix}${detail ? ` · ${detail}` : ''}` : detail;
+    this.emitSnapshot();
+  }
+
+  // Attach a Live Photo's motion to its still, which `still` (the still's
+  // upload result) has just put in, or found in, the account (iOS 0.3.9 Back
+  // Up Live Photo Motion). Returns the row's note. A transient failure throws
+  // so the row retries: the still then resolves at once and only the motion
+  // repeats. A permanent refusal does not: the photo is backed up, so the row
+  // finishes and says the motion was refused.
+  async attachMotion(item, still, { modified, useQuota, saver }) {
+    try {
+      const motion = await this.client.uploadMotion(item.motion.path, {
+        stillHash: still.hash,
+        filename: item.motion.filename,
+        modified,
+        useQuota,
+        saver,
+        signal: this.abort.signal,
+        onPhase: (phase) => this.showPhase(item, phase, 'Live Photo motion'),
+      });
+      if (motion.outcome === 'attached' && motion.mediaKey !== still.mediaKey) {
+        eventLog().record('livePhoto', "Google answered a motion with a media key other than its photo's", 'warning');
+      }
+      eventLog().record('livePhoto', `A Live Photo motion finished: ${motion.outcome}`);
+      return MOTION_NOTES[motion.outcome];
+    } catch (error) {
+      if (error instanceof GPMCError && (error.kind === 'malformed' || (error.kind === 'server' && !error.retryable))) {
+        eventLog().record('livePhoto', `Google refused a Live Photo motion: ${error.message}`, 'warning');
+        return `Photo backed up; its Live Photo motion was refused: ${error.message}`;
+      }
+      throw error;
+    }
+  }
+
   // Put one media item into the album named after the file's folder, creating
   // the album the first time that name is seen for this account.
   async addToFolderAlbum(item, mediaKey, model) {
@@ -412,20 +564,52 @@ class UploadQueue {
         // Google Photos; forget it and make a new one below. Transient and
         // credential errors go to runItem's usual handling.
         if (!(error instanceof GPMCError) || error.kind !== 'server' || error.retryable) throw error;
-        this.settings.saveAlbum(this.email, name, null);
+        // Another upload from this folder may have met the same refusal while
+        // this one waited, and be making, or have saved, the replacement.
+        const replacing = this.albumCreations.get(name);
+        if (replacing) {
+          await this.client.addMediaToAlbum(await replacing, [mediaKey], { model });
+          return;
+        }
+        const replacement = this.settings.albumKey(this.email, name);
+        if (replacement && replacement !== known) {
+          await this.client.addMediaToAlbum(replacement, [mediaKey], { model });
+          return;
+        }
+        this.saveAlbumKey(name, null);
         eventLog().record('album', `Google refused a saved album, so a new one will be made: ${error.message}`, 'warning');
       }
     }
     // The new album is created holding this item, as gotohp does.
     const creation = this.client.createAlbum(name, [mediaKey], { model })
       .then((key) => {
-        this.settings.saveAlbum(this.email, name, key);
+        this.saveAlbumKey(name, key);
         eventLog().record('album', 'Created an album for a backed-up folder');
         return key;
       })
       .finally(() => this.albumCreations.delete(name));
     this.albumCreations.set(name, creation);
     await creation;
+  }
+
+  // A record that cannot be written must not fail an upload that worked: the
+  // item is in its album; the next upload from that folder makes another.
+  saveAlbumKey(name, key) {
+    try {
+      this.settings.saveAlbum(this.email, name, key);
+    } catch (error) {
+      eventLog().record('album', `Could not save an album record: ${error.message}`, 'error');
+    }
+  }
+
+  // What a re-upload came back with. The same media key means Google kept the
+  // copy it already had, so the storage it uses probably did not change; a
+  // new key means a new item, and the earlier copy may still use storage.
+  static reuploadNote(result) {
+    if (!result.previousKey) return 'Re-uploaded; Google had no copy of it';
+    return result.mediaKey === result.previousKey
+      ? 'Re-uploaded; Google kept the copy it already had'
+      : 'Re-uploaded as a new item; the earlier copy may still use storage';
   }
 
   // Keep the newest failures and drop the oldest, so a long backup that goes
@@ -500,16 +684,26 @@ class UploadQueue {
   // a minute so the quota window can reset without burning every item's
   // retry budget.
   noteQuotaRejection() {
-    this.cooldownUntil = Date.now() + this.quotaCooldownMs;
-    this.cooldownReason = 'Google rate limit (429) — pausing new uploads for a minute';
-    eventLog().record('queue', 'Google rate limit (429); pausing new upload starts for a minute');
+    // Uploads running side by side meet the same limit; only the first
+    // refusal of a window sets the pause.
+    if (this.cooldownUntil > Date.now()) return;
+    const wait = Math.min(this.quotaCooldownMs * QUOTA_COOLDOWN_GROWTH_LIMIT,
+      this.quotaCooldownMs * 2 ** this.quotaStrikes);
+    this.quotaStrikes += 1;
+    this.cooldownUntil = Date.now() + wait;
+    const minutes = Math.max(1, Math.round(wait / 60000));
+    const span = `${minutes} minute${minutes === 1 ? '' : 's'}`;
+    this.cooldownReason = `Google rate limit (429) — pausing new uploads for ${span}`;
+    eventLog().record('queue', `Google rate limit (429); pausing new upload starts for ${span}`);
     this.emitSnapshot();
   }
 
   // Everything the diagnostic report shows about the queue.
   diagnosticInfo() {
     let completedCount = null;
-    try { completedCount = this.settings.loadCompleted(this.email).size; } catch { /* report only */ }
+    try {
+      completedCount = this.settings.completedCount?.(this.email) ?? this.settings.loadCompleted(this.email).size;
+    } catch { /* report only */ }
     return {
       counts: this.summary(),
       halted: this.haltReason,

@@ -59,6 +59,26 @@ async function waitFor(condition, timeout = 5000) {
   throw new Error('condition not met in time');
 }
 
+async function snapshotWindow() {
+  await withQueue({ upload: () => new Promise(() => {}) }, async (queue) => {
+    queue.maxConcurrent = 2;
+    await queue.enqueueScan(items(1000), Infinity);
+    queue.items.slice(2, 302).forEach((item) => { item.status = 'uploaded'; queue.noteDone(item); });
+    queue.items.slice(302, 312).forEach((item) => { item.status = 'failed'; });
+    const snap = await lastSnapshot(queue);
+    assert.strictEqual(snap.limited, true);
+    assert.strictEqual(snap.counts.total, 1000, 'counts still cover every row');
+    const by = (status) => snap.items.filter((i) => i.status === status).length;
+    assert.strictEqual(by('waiting'), 50);
+    assert.strictEqual(by('failed'), 10);
+    assert.strictEqual(by('uploaded'), 100, 'only the latest finished rows');
+    assert.strictEqual(snap.items.find((i) => i.status === 'uploaded').path, queue.items[202].path);
+    assert.strictEqual(snap.items.length, 2 + 50 + 10 + 100);
+    queue.cancelAll();
+  });
+  console.log('test 8 OK: a large queue sends a window of rows with full counts');
+}
+
 async function main() {
   // Upstream backoff schedule: min(30, 2^attempt) — 2, 4, 8, capped at 30.
   assert.deepStrictEqual([1, 2, 3, 4, 5].map(backoffSeconds), [2, 4, 8, 16, 30]);
@@ -81,27 +101,41 @@ async function main() {
   });
   console.log('test 1 OK: batches are bounded, sequential, and deduplicated');
 
-  // 2. 429 → retry with backoff + queue-wide cooldown.
+  // 2. 429 → the attempt is given back and the queue waits out a pause that
+  // doubles while Google keeps refusing (upstream iOS d9b7afa).
+  let refusals = 0;
+  const pauses = [];
   await withQueue({
     upload: async (path, { onPhase }) => {
       onPhase({ phase: 'hashing', fraction: 1 });
-      throw serverError(429);
+      if (refusals < 4) { refusals += 1; throw serverError(429); }
+      return { outcome: 'uploaded', mediaKey: 'k' };
     },
   }, async (queue) => {
-    queue.quotaCooldownMs = 3000; // test-sized cooldown
+    queue.quotaCooldownMs = 100; // test-sized: 100, 200, 400, then the cap of 1000
+    queue.maxConcurrent = 1; // one refusal per pause, so the doubling is exact
+    const note = queue.noteQuotaRejection.bind(queue);
+    queue.noteQuotaRejection = () => {
+      const before = queue.cooldownUntil;
+      note();
+      if (queue.cooldownUntil !== before) pauses.push(Math.round((queue.cooldownUntil - Date.now()) / 100) * 100);
+    };
     await queue.enqueueScan(items(1), 250);
-    await waitFor(() => queue.items[0].attempts >= 1);
     await waitFor(() => queue.cooldownUntil > Date.now(), 2000);
     // While cooling down, the pump must not start new items.
     await queue.enqueueScan(items(1).map((i) => ({ ...i, path: '/photos/other.jpg' })), 250);
-    const started = queue.items.filter((i) => i.attempts > 0).length;
-    assert.strictEqual(started, 1, 'cooldown prevents new item starts');
-    await waitFor(() => queue.items[0].status === 'failed', 20000);
-    assert.strictEqual(queue.items[0].attempts, 3, 'three attempts, then failed (retryable)');
-    assert.match(queue.items[0].error, /HTTP 429/);
-    queue.cancelAll();
+    assert.strictEqual(queue.items[1].status, 'waiting', 'cooldown prevents new item starts');
+    await waitFor(() => queue.items.every((i) => i.status === 'uploaded'), 10000);
+    assert.strictEqual(refusals, 4);
+    assert.ok(queue.items.every((i) => i.attempts === 1), 'rate limits did not use up attempts');
+    assert.deepStrictEqual(pauses, [100, 200, 400, 800]);
+    assert.strictEqual(queue.quotaStrikes, 0, 'a success resets the pause');
+    queue.quotaStrikes = 5;
+    queue.cooldownUntil = 0;
+    queue.noteQuotaRejection();
+    assert.strictEqual(pauses.at(-1), 1000, 'the pause stops growing at ten times the first');
   });
-  console.log('test 2 OK: 429 arms a cooldown and retries with upstream backoff');
+  console.log('test 2 OK: 429 gives the attempt back and waits out a growing pause');
 
   // 3. Credential rejection halts the queue and requeues the item.
   await withQueue({
@@ -192,6 +226,7 @@ async function main() {
     assert.strictEqual(queue.maxConcurrent, 1);
   });
   console.log('test 7 OK: concurrency is configurable and clamped to 1–10');
+  await snapshotWindow();
 
   console.log('queue-test: all assertions passed');
   process.exit(0);

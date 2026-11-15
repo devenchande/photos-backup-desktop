@@ -9,6 +9,7 @@ const { connectAccount } = require('./auth');
 const { CredentialStore } = require('./credentialStore');
 const { Settings } = require('./settings');
 const { scanFolders, inspectPaths, MEDIA_EXTENSIONS } = require('./mediaScanner');
+const { pairLivePhotos } = require('./livePhotos');
 const { UploadQueue, clampConcurrency } = require('./uploadQueue');
 const TokenExchange = require('./tokenExchange');
 const { GPMCClient, GPMCError } = require('./gpmc');
@@ -62,8 +63,23 @@ async function runBackup({ recheck = false } = {}) {
   const found = await scanFolders(folders);
   send('scan-finished', { count: found.length });
   eventLog().record('queue', `Scanned the configured folders: ${found.length} media file${found.length === 1 ? '' : 's'} found`);
-  const { queued } = await queue.enqueueScan(found);
+  const pending = await withLivePhotos(found.filter((file) => !settings.isCompleted(queue.email, file)));
+  const { queued } = await queue.enqueueScan(pending);
   return { found: found.length, queued, released, recheck };
+}
+
+// Join Live Photo stills and videos among files about to be queued, when
+// Live Photos is on. Called after already-backed-up files are dropped, so
+// their metadata is never read again.
+async function withLivePhotos(files) {
+  if (!settings.get('livePhotos') || !files.length) return files;
+  const { items, paired, unreadable } = await pairLivePhotos(files);
+  if (paired) eventLog().record('livePhoto', `Paired ${paired} Live Photo${paired === 1 ? '' : 's'}`);
+  if (unreadable) {
+    eventLog().record('livePhoto',
+      `Could not read Live Photo details in ${unreadable} file${unreadable === 1 ? '' : 's'}; they upload on their own`, 'warning');
+  }
+  return items;
 }
 
 // Add folders to the backup list; returns how many were new.
@@ -76,13 +92,82 @@ function addFolders(paths) {
 }
 
 // Queue files the user picked or dropped for a one-off upload, the desktop
-// take on choosing photos in the iOS app. They are not folders being backed
+// take on choosing photos in the iOS app. Chosen files are checked with
+// Google even when recorded as backed up. They are not folders being backed
 // up, so they never go into folder albums.
 async function uploadFiles(files) {
   if (!queue) return { error: 'not-connected' };
-  const { queued } = await queue.enqueueScan(files.map((file) => ({ ...file, skipAlbum: true })));
+  const result = await queue.enqueueChosen(await withLivePhotos(files), { skipAlbum: true });
   eventLog().record('queue', `You chose ${files.length} file${files.length === 1 ? '' : 's'} to upload`);
-  return { queued, alreadyDone: files.length - queued };
+  return result;
+}
+
+// Re-upload (iOS 0.3.9): the chosen files are uploaded again, even where
+// Google already holds them, so they are committed under the quota-free
+// device profile. Refused here as well as hidden in the window while Allow
+// re-upload is off or uploads count against quota.
+function reuploadRefusal() {
+  if (!queue) return { error: 'not-connected' };
+  if (!settings.get('allowReupload')) return { error: 'reupload-off' };
+  if (settings.get('useQuota')) return { error: 'reupload-quota' };
+  return null;
+}
+
+const fileCount = (n) => `${n} file${n === 1 ? '' : 's'}`;
+
+// The warning both re-upload buttons show before anything is sent.
+async function confirmReupload(title, message, what) {
+  const { response } = await dialog.showMessageBox(mainWindow, {
+    type: 'warning',
+    buttons: ['Re-upload', 'Cancel'],
+    defaultId: 1,
+    cancelId: 1,
+    title,
+    message,
+    detail: `${what} uploaded again, including ones already in Google Photos. This takes as long and uses as much `
+      + 'data as uploading them the first time. Google Photos may keep the copy it already has, so try a few '
+      + 'files first and compare your storage before and after.',
+  });
+  return response === 0;
+}
+
+// Re-upload a Folder…: every photo and video in the folder and its subfolders.
+async function reuploadFolder() {
+  const refusal = reuploadRefusal();
+  if (refusal) return refusal;
+  const picked = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose a folder to upload again',
+    properties: ['openDirectory'],
+  });
+  if (picked.canceled || !picked.filePaths.length) return { canceled: true };
+  const folder = picked.filePaths[0];
+  const found = await scanFolders([folder]);
+  if (!found.length) return { queued: 0, alreadyDone: 0, skipped: 0 };
+  if (!await confirmReupload('Upload this folder again?',
+    `Upload the ${fileCount(found.length)} in “${path.basename(folder)}” again?`,
+    'Every photo and video in this folder and its subfolders is')) return { canceled: true };
+  eventLog().record('reupload', `You chose to re-upload a folder of ${fileCount(found.length)}`);
+  return queue.enqueueChosen(await withLivePhotos(found), { forceUpload: true });
+}
+
+// Re-upload Photos…: photos and videos picked one by one. Like Upload
+// Photos…, they are not a folder being backed up, so they skip folder albums.
+async function reuploadFiles() {
+  const refusal = reuploadRefusal();
+  if (refusal) return refusal;
+  const picked = await dialog.showOpenDialog(mainWindow, {
+    title: 'Choose photos and videos to upload again',
+    properties: ['openFile', 'multiSelections'],
+    filters: [{ name: 'Photos and videos', extensions: MEDIA_EXTENSIONS }],
+  });
+  if (picked.canceled || !picked.filePaths.length) return { canceled: true };
+  const { files, skipped } = await inspectPaths(picked.filePaths);
+  if (!files.length) return { queued: 0, alreadyDone: 0, skipped };
+  if (!await confirmReupload('Upload these photos again?',
+    `Upload the ${fileCount(files.length)} you picked again?`,
+    'Every photo and video you picked is')) return { canceled: true };
+  eventLog().record('reupload', `You chose to re-upload ${fileCount(files.length)}`);
+  return { ...(await queue.enqueueChosen(await withLivePhotos(files), { forceUpload: true, skipAlbum: true })), skipped };
 }
 
 function createWindow() {
@@ -262,7 +347,7 @@ function registerIpc() {
 
   ipcMain.handle('update-settings', (_event, patch) => {
     const allowed = {};
-    for (const key of ['storageSaver', 'useQuota', 'dateFromFilename', 'albumsFromFolders', 'autoStart']) {
+    for (const key of ['storageSaver', 'useQuota', 'dateFromFilename', 'albumsFromFolders', 'allowReupload', 'livePhotos', 'autoStart']) {
       if (key in patch) allowed[key] = !!patch[key];
     }
     if ('concurrency' in patch) allowed.concurrency = clampConcurrency(patch.concurrency);
@@ -273,6 +358,8 @@ function registerIpc() {
   });
 
   ipcMain.handle('run-backup', () => runBackup());
+  ipcMain.handle('reupload-folder', () => reuploadFolder());
+  ipcMain.handle('reupload-files', () => reuploadFiles());
   ipcMain.handle('recheck-backup', () => runBackup({ recheck: true }));
 
   ipcMain.handle('queue-pause', () => { queue?.pause(); return { ok: true }; });
